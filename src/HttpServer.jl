@@ -5,6 +5,8 @@
 module HttpServer
 
 using HttpCommon
+using GnuTLS
+
 include("RequestParser.jl")
 export HttpHandler,
        Server,
@@ -16,6 +18,24 @@ export HttpHandler,
        encodeURI,
        decodeURI,
        parsequerystring
+
+import Base: bind
+
+# Client encapsulates a single connection
+#
+# When new connections are initialized a `Client` is created with a new id and
+# the connection socket. `Client.parser` will store a `ClientParser` to handle
+# all HTTP parsing for the connection lifecycle.
+#
+type Client{T<:IO}
+    id::Int
+    sock::T
+    parser::ClientParser
+    client_cert::Certificate
+
+    Client(id::Int,sock::T) = new(id,sock)
+end
+Client{T<:IO}(id::Int,sock::T) = Client{T}(id,sock)
 
 # `HttpHandler` types are used to instantiate a `Server`.
 #
@@ -74,22 +94,13 @@ immutable HttpHandler
 
     HttpHandler(handle::Function) = new(handle, Base.TcpServer(), Dict{ASCIIString, Function}())
 end
-handle(handler::HttpHandler, req::Request, res::Response) = handler.handle(req, res)
-
-# Client encapsulates a single connection
-#
-# When new connections are initialized a `Client` is created with a new id and
-# the connection socket. `Client.parser` will store a `ClientParser` to handle
-# all HTTP parsing for the connection lifecycle.
-#
-type Client{T<:IO}
-    id::Int
-    sock::T
-    parser::ClientParser
-
-    Client(id::Int,sock::T) = new(id,sock)
+function handle(handler::HttpHandler, client::Client, req::Request, res::Response) 
+    if !isdefined(client,:client_cert)
+        handler.handle(req, res)
+    else
+        handler.handle(req, res, client.client_cert)
+    end
 end
-Client{T<:IO}(id::Int,sock::T) = Client{T}(id,sock)
 
 # `WebSocketInterface` defines the abstract protocol for a WebSocketHandler.
 #
@@ -176,32 +187,40 @@ function run(server::Server, port::Integer)
     end
 end
 
-using GnuTLS
-
-run_https(server::Server, auth::GnuTLS.CertificateStore, port::Integer) = run_https(server, auth, IPv4(0), port)
-function run_https(server::Server, auth::GnuTLS.CertificateStore, args...)
+run_https(server::Server, auth::GnuTLS.CertificateStore, port::Integer; client_cert = false) = run_https(server, auth, IPv4(0), port; client_cert = client_cert)
+function run_https(server::Server, auth::GnuTLS.CertificateStore, args...; client_cert = false)
     id_pool = 0
-    bind(server.http.sock,args...) || error("Given address not usable")
+    Base.bind(server.http.sock,args...) || error("Given address not usable")
     listen(server.http.sock)
     event("listen", server, args...)
     websockets_enabled = server.websock != nothing
 
-    while true
-        sess = GnuTLS.Session(true)
-        set_priority_string!(sess)
-        set_credentials!(sess,auth)
-        client = accept(server.http.sock)
-        try
-            associate_stream(sess,client)
-            handshake!(sess)
-        catch e
-            println("Error establishing SSL connection: ", e)
-            close(client)
-            continue
+    try
+        while true
+            sess = GnuTLS.Session(true)
+            set_priority_string!(sess)
+            set_credentials!(sess,auth)
+            if client_cert
+                GnuTLS.set_prompt_client_certificate!(sess,true)
+            end
+            client = accept(server.http.sock)
+            try
+                associate_stream(sess,client)
+                handshake!(sess)
+            catch e
+                println("Error establishing SSL connection: ", e)
+                close(client)
+                continue
+            end
+            client = Client(id_pool += 1, sess)
+            if client_cert
+                client.client_cert = GnuTLS.get_peer_certificate(sess) 
+            end
+            client.parser = ClientParser(message_handler(server, client, websockets_enabled))
+            @async process_client(server, client, websockets_enabled) 
         end
-        client = Client(id_pool += 1, sess)
-        client.parser = ClientParser(message_handler(server, client, websockets_enabled))
-        @async process_client(server, client, websockets_enabled) 
+    catch e
+        println("FATAL Server Error:", e)
     end
 end
 
@@ -260,7 +279,7 @@ function message_handler(server::Server, client::Client, websockets_enabled::Boo
         local response
 
         try
-            response = handle(server.http, req, Response()) # Run the server handler
+            response = handle(server.http, client, req, Response()) # Run the server handler
             if !isa(response, Response)                     # Promote return to Response
                 response = Response(response)
             end
